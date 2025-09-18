@@ -1,0 +1,171 @@
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
+
+/// GeoJSON の Polygon / MultiPolygon を flutter_map の Polygon に変換して
+/// 薄い赤塗りで重ねて表示します。
+/// - GeoJSON 座標順は [lng, lat]
+/// - flutter_map の LatLng は (lat, lng)
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final polygons = await _loadTokyoPolygonsFromGeoJson(assetPath: 'assets/tokyo_mainland.geojson');
+  runApp(TokyoPolygonApp(polygons: polygons));
+}
+
+class TokyoPolygonApp extends StatelessWidget {
+  const TokyoPolygonApp({super.key, required this.polygons});
+
+  final List<Polygon> polygons;
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Tokyo Polygon Overlay',
+      theme: ThemeData(useMaterial3: true, colorSchemeSeed: const Color(0xFFE53935)),
+      home: TokyoMapPage(polygons: polygons),
+    );
+  }
+}
+
+class TokyoMapPage extends StatelessWidget {
+  const TokyoMapPage({super.key, required this.polygons});
+
+  final List<Polygon> polygons;
+
+  @override
+  Widget build(BuildContext context) {
+    // 地図の初期中心は都庁あたり
+    const center = LatLng(35.6895, 139.6917);
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('東京都ポリゴン（薄赤オーバーレイ）')),
+      body: FlutterMap(
+        options: const MapOptions(
+          initialCenter: center,
+          initialZoom: 9.5, // お好みで
+        ),
+        children: [
+          // OSM タイル
+          TileLayer(
+            urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+            userAgentPackageName: 'com.example.tokyo_polygon_demo',
+          ),
+          // 東京都の赤塗りポリゴン
+          PolygonLayer(polygons: polygons),
+        ],
+      ),
+    );
+  }
+}
+
+/// ====== GeoJSON 読み込みと Polygon 変換 ======
+
+/// GeoJSON（Polygon / MultiPolygon / Feature / FeatureCollection）を読み込み、
+/// flutter_map の Polygon リストに変換して返す。
+Future<List<Polygon>> _loadTokyoPolygonsFromGeoJson({required String assetPath}) async {
+  final text = await rootBundle.loadString(assetPath);
+  final data = jsonDecode(text);
+
+  Map<String, dynamic>? geom;
+
+  // geometry を取り出す（Feature / FeatureCollection / 直接 geometry を許容）
+  final type = data['type'] as String?;
+  if (type == 'Feature') {
+    geom = Map<String, dynamic>.from(data['geometry'] as Map);
+  } else if (type == 'FeatureCollection') {
+    final features = (data['features'] as List);
+    if (features.isEmpty) throw Exception('FeatureCollection が空です');
+    geom = Map<String, dynamic>.from(features.first['geometry'] as Map);
+  } else if (type == 'Polygon' || type == 'MultiPolygon') {
+    geom = Map<String, dynamic>.from(data as Map);
+  } else {
+    throw Exception('未対応の GeoJSON type: $type');
+  }
+
+  if (geom == null || geom['type'] == null) {
+    throw Exception('geometry が見つかりません');
+  }
+
+  final gType = geom['type'] as String;
+  final List<Polygon> result = [];
+
+  // 共通の描画スタイル（薄い赤）
+  const fill = Color(0x33FF0000); // 透明赤（0x33 = 約20%）
+  const stroke = Color(0x88FF0000);
+  const strokeWidth = 1.5;
+
+  if (gType == 'Polygon') {
+    // [rings][points][lng/lat]
+    final rings = (geom['coordinates'] as List)
+        .map<List<List<double>>>(
+          (ring) => (ring as List)
+              .map<List<double>>((pt) => (pt as List).map((n) => (n as num).toDouble()).toList())
+              .toList(),
+        )
+        .toList();
+
+    final polygon = _polygonFromRings(rings, fillColor: fill, borderColor: stroke, borderWidth: strokeWidth);
+    result.add(polygon);
+  } else if (gType == 'MultiPolygon') {
+    // [polygons][rings][points][lng/lat]
+    final polys = (geom['coordinates'] as List)
+        .map<List<List<List<double>>>>(
+          (poly) => (poly as List)
+              .map<List<List<double>>>(
+                (ring) => (ring as List)
+                    .map<List<double>>((pt) => (pt as List).map((n) => (n as num).toDouble()).toList())
+                    .toList(),
+              )
+              .toList(),
+        )
+        .toList();
+
+    for (final rings in polys) {
+      final polygon = _polygonFromRings(rings, fillColor: fill, borderColor: stroke, borderWidth: strokeWidth);
+      result.add(polygon);
+    }
+  } else {
+    throw Exception('未対応の geometry.type: $gType');
+  }
+
+  return result;
+}
+
+/// GeoJSON の rings を flutter_map の Polygon に変換する。
+/// rings[0] が外周、rings[1..] は穴（オプション）。
+Polygon _polygonFromRings(
+  List<List<List<double>>> rings, {
+  required Color fillColor,
+  required Color borderColor,
+  required double borderWidth,
+}) {
+  if (rings.isEmpty) {
+    throw Exception('rings が空です');
+  }
+
+  // 外周
+  final outer = rings.first
+      .map((p) => LatLng(p[1], p[0])) // [lng, lat] → (lat, lng)
+      .toList();
+
+  // 穴（ある場合のみ）
+  final holes = <List<LatLng>>[];
+  if (rings.length > 1) {
+    for (int i = 1; i < rings.length; i++) {
+      final hole = rings[i].map((p) => LatLng(p[1], p[0])).toList();
+      holes.add(hole);
+    }
+  }
+
+  return Polygon(
+    points: outer,
+    holePointsList: holes.isEmpty ? null : holes,
+    isFilled: true,
+    color: fillColor,
+    borderColor: borderColor,
+    borderStrokeWidth: borderWidth,
+  );
+}

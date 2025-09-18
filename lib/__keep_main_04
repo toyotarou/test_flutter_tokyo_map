@@ -1,0 +1,361 @@
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
+
+/// ---- 設定 ----
+const String kTokyoMunicipalAsset = 'assets/tokyo_municipal.geojson';
+
+/// 区市町村（1自治体=1Feature想定）
+class MunicipalGeom {
+  final String name; // 例: 港区 / 練馬区 / 立川市 / 奥多摩町
+  final String kind; // '区' / '市' / '町村'
+  final List<List<List<List<double>>>> polygons; // [poly][rings][points][lng/lat]
+
+  // 近い順ソート用
+  late final double centroidLat;
+  late final double centroidLng;
+  int? zKey; // Morton(Z-order)キー
+
+  MunicipalGeom({required this.name, required this.kind, required this.polygons}) {
+    final c = _computeCentroid(polygons);
+    centroidLat = c.$1;
+    centroidLng = c.$2;
+  }
+}
+
+/// 外周リングの単純平均で重心を出す（十分に実用）
+(double, double) _computeCentroid(List<List<List<List<double>>>> polys) {
+  double sumLat = 0, sumLng = 0;
+  int cnt = 0;
+  for (final rings in polys) {
+    if (rings.isEmpty) continue;
+    for (final p in rings.first) {
+      // 外周
+      sumLng += p[0];
+      sumLat += p[1];
+      cnt++;
+    }
+  }
+  if (cnt == 0) return (0, 0);
+  return (sumLat / cnt, sumLng / cnt);
+}
+
+/// GeoJSON 読み込み（FeatureCollection / Feature）
+Future<List<MunicipalGeom>> loadTokyoMunicipals(String assetPath) async {
+  final text = await rootBundle.loadString(assetPath);
+  final data = jsonDecode(text);
+
+  final List features;
+  if (data['type'] == 'FeatureCollection') {
+    features = (data['features'] as List);
+  } else if (data['type'] == 'Feature') {
+    features = [data];
+  } else {
+    throw Exception('Unsupported GeoJSON root: ${data['type']}');
+  }
+
+  final list = <MunicipalGeom>[];
+  for (final f in features) {
+    final props = Map<String, dynamic>.from(f['properties'] ?? {});
+    final geom = Map<String, dynamic>.from(f['geometry'] ?? {});
+    if (geom.isEmpty) continue;
+
+    final rawName = (props['N03_004'] ?? props['name'] ?? '') as String;
+    if (rawName.isEmpty) continue;
+
+    final kind = rawName.endsWith('区')
+        ? '区'
+        : rawName.endsWith('市')
+        ? '市'
+        : '町村';
+
+    final type = geom['type'] as String;
+    final coords = geom['coordinates'];
+
+    if (type == 'Polygon') {
+      final poly = (coords as List)
+          .map<List<List<double>>>(
+            (ring) => (ring as List)
+                .map<List<double>>((pt) => (pt as List).map((n) => (n as num).toDouble()).toList())
+                .toList(),
+          )
+          .toList();
+      list.add(MunicipalGeom(name: rawName, kind: kind, polygons: [poly]));
+    } else if (type == 'MultiPolygon') {
+      final mpoly = (coords as List)
+          .map<List<List<List<double>>>>(
+            (poly) => (poly as List)
+                .map<List<List<double>>>(
+                  (ring) => (ring as List)
+                      .map<List<double>>((pt) => (pt as List).map((n) => (n as num).toDouble()).toList())
+                      .toList(),
+                )
+                .toList(),
+          )
+          .toList();
+      list.add(MunicipalGeom(name: rawName, kind: kind, polygons: mpoly));
+    }
+  }
+  return list;
+}
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final municipals = await loadTokyoMunicipals(kTokyoMunicipalAsset);
+
+  // 近い順ソートのための Z-order キーを割り当て
+  final gb = _globalBoundsForCenters(municipals);
+  _assignZOrderKeys(municipals, gb);
+
+  runApp(TokyoSelectApp(municipals: municipals));
+}
+
+class TokyoSelectApp extends StatelessWidget {
+  const TokyoSelectApp({super.key, required this.municipals});
+
+  final List<MunicipalGeom> municipals;
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Tokyo Select Overlay (Z-order sort)',
+      theme: ThemeData(useMaterial3: true, colorSchemeSeed: const Color(0xFFE53935)),
+      home: TokyoSelectPage(municipals: municipals),
+    );
+  }
+}
+
+class TokyoSelectPage extends StatefulWidget {
+  const TokyoSelectPage({super.key, required this.municipals});
+
+  final List<MunicipalGeom> municipals;
+
+  @override
+  State<TokyoSelectPage> createState() => _TokyoSelectPageState();
+}
+
+class _TokyoSelectPageState extends State<TokyoSelectPage> {
+  final MapController _mapController = MapController();
+
+  String _category = '区'; // '区' / '市' / '町村'
+  String? _selectedName; // 例: '港区'
+  final _center = const LatLng(35.6895, 139.6917); // 都庁
+
+  late final Map<String, LatLngBounds> _boundsByName = {for (final m in widget.municipals) m.name: _computeBounds(m)};
+
+  @override
+  Widget build(BuildContext context) {
+    final filtered = widget.municipals.where((m) => m.kind == _category).toList()
+      ..sort((a, b) {
+        // 近い順（Z-order）。同値時は名前で安定化
+        final ka = a.zKey ?? 0, kb = b.zKey ?? 0;
+        if (ka != kb) return ka.compareTo(kb);
+        return a.name.compareTo(b.name);
+      });
+
+    // ポリゴン描画
+    final polygons = <Polygon>[];
+    for (final m in widget.municipals) {
+      final isSelected = (m.name == _selectedName);
+      final fill = isSelected ? const Color(0x55FF0000) : const Color(0x22000000);
+      final stroke = isSelected ? const Color(0xFFFF0000) : const Color(0x55000000);
+      final strokeWidth = isSelected ? 2.0 : 1.0;
+
+      for (final rings in m.polygons) {
+        final outer = rings.first.map((p) => LatLng(p[1], p[0])).toList();
+        final holes = <List<LatLng>>[];
+        for (int i = 1; i < rings.length; i++) {
+          holes.add(rings[i].map((p) => LatLng(p[1], p[0])).toList());
+        }
+        polygons.add(
+          Polygon(
+            points: outer,
+            holePointsList: holes.isEmpty ? null : holes,
+            isFilled: true,
+            color: fill,
+            borderColor: stroke,
+            borderStrokeWidth: strokeWidth,
+          ),
+        );
+      }
+    }
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('東京都 区市町村（近い順ソート＋選択で自動ズーム）')),
+      body: Column(
+        children: [
+          // カテゴリ切替
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
+            child: Wrap(
+              spacing: 8,
+              children: [
+                _CatButton(
+                  label: '23区',
+                  selected: _category == '区',
+                  onTap: () => setState(() {
+                    _category = '区';
+                    _selectedName = null;
+                  }),
+                ),
+                _CatButton(
+                  label: '26市',
+                  selected: _category == '市',
+                  onTap: () => setState(() {
+                    _category = '市';
+                    _selectedName = null;
+                  }),
+                ),
+                _CatButton(
+                  label: '町村',
+                  selected: _category == '町村',
+                  onTap: () => setState(() {
+                    _category = '町村';
+                    _selectedName = null;
+                  }),
+                ),
+              ],
+            ),
+          ),
+          // 近い順の名前チップ
+          SizedBox(
+            height: 56,
+            child: ListView.separated(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              scrollDirection: Axis.horizontal,
+              itemCount: filtered.length,
+              separatorBuilder: (_, __) => const SizedBox(width: 8),
+              itemBuilder: (context, i) {
+                final name = filtered[i].name;
+                final selected = name == _selectedName;
+                return ChoiceChip(selected: selected, label: Text(name), onSelected: (_) => _onSelectName(name));
+              },
+            ),
+          ),
+          const SizedBox(height: 8),
+          // 地図
+          Expanded(
+            child: FlutterMap(
+              mapController: _mapController,
+              options: MapOptions(
+                initialCenter: _center,
+                initialZoom: 9.5,
+                onTap: (_, __) => setState(() => _selectedName = null),
+              ),
+              children: [
+                TileLayer(
+                  urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                  userAgentPackageName: 'com.example.tokyo_select_overlay',
+                ),
+                PolygonLayer(polygons: polygons),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 自治体選択 → 自動ズーム
+  void _onSelectName(String name) {
+    setState(() => _selectedName = name);
+
+    final b = _boundsByName[name];
+    if (b == null) return;
+    final fit = CameraFit.bounds(bounds: b, padding: const EdgeInsets.all(24));
+    _mapController.fitCamera(fit);
+  }
+
+  /// 自治体の外接矩形（MultiPolygon全体）
+  LatLngBounds _computeBounds(MunicipalGeom m) {
+    double? minLat, minLng, maxLat, maxLng;
+    for (final rings in m.polygons) {
+      for (final pt in rings.first) {
+        // 外周でOK
+        final lng = pt[0], lat = pt[1];
+        minLat = (minLat == null) ? lat : (lat < minLat ? lat : minLat);
+        maxLat = (maxLat == null) ? lat : (lat > maxLat ? lat : maxLat);
+        minLng = (minLng == null) ? lng : (lng < minLng ? lng : minLng);
+        maxLng = (maxLng == null) ? lng : (lng > maxLng ? lng : maxLng);
+      }
+    }
+    final sw = LatLng(minLat ?? 0, minLng ?? 0);
+    final ne = LatLng(maxLat ?? 0, maxLng ?? 0);
+    return LatLngBounds(sw, ne);
+  }
+}
+
+/// 近い順ソート用：全体の重心範囲
+class _GlobalBounds {
+  final double minLat, maxLat, minLng, maxLng;
+
+  const _GlobalBounds(this.minLat, this.maxLat, this.minLng, this.maxLng);
+}
+
+_GlobalBounds _globalBoundsForCenters(List<MunicipalGeom> list) {
+  double minLat = 90, maxLat = -90, minLng = 180, maxLng = -180;
+  for (final m in list) {
+    if (m.centroidLat < minLat) minLat = m.centroidLat;
+    if (m.centroidLat > maxLat) maxLat = m.centroidLat;
+    if (m.centroidLng < minLng) minLng = m.centroidLng;
+    if (m.centroidLng > maxLng) maxLng = m.centroidLng;
+  }
+  return _GlobalBounds(minLat, maxLat, minLng, maxLng);
+}
+
+/// 全自治体に Z-order (Morton) キーを割り当て
+void _assignZOrderKeys(List<MunicipalGeom> list, _GlobalBounds gb) {
+  for (final m in list) {
+    final nx = _normalize(m.centroidLng, gb.minLng, gb.maxLng); // x=lng
+    final ny = _normalize(m.centroidLat, gb.minLat, gb.maxLat); // y=lat
+    m.zKey = _mortonKey16(nx, ny);
+  }
+}
+
+/// 0..1 正規化
+double _normalize(double v, double vmin, double vmax) {
+  final d = (vmax - vmin);
+  if (d == 0) return 0.5;
+  return (v - vmin) / d;
+}
+
+/// 16bit x/y をインターリーブして Z-order キーに
+int _mortonKey16(double normX, double normY) {
+  int x = (normX.clamp(0.0, 1.0) * 65535).round();
+  int y = (normY.clamp(0.0, 1.0) * 65535).round();
+  return _interleave16(x) | (_interleave16(y) << 1);
+}
+
+int _interleave16(int n) {
+  int x = n & 0xFFFF;
+  x = (x | (x << 8)) & 0x00FF00FF;
+  x = (x | (x << 4)) & 0x0F0F0F0F;
+  x = (x | (x << 2)) & 0x33333333;
+  x = (x | (x << 1)) & 0x55555555;
+  return x;
+}
+
+/// UI部品：カテゴリボタン
+class _CatButton extends StatelessWidget {
+  const _CatButton({required this.label, required this.selected, required this.onTap});
+
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = selected ? Theme.of(context).colorScheme.primary : Colors.black54;
+    return OutlinedButton(
+      onPressed: onTap,
+      style: OutlinedButton.styleFrom(
+        side: BorderSide(color: color),
+        foregroundColor: color,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      ),
+      child: Text(label),
+    );
+  }
+}
